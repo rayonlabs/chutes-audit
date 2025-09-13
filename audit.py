@@ -4,6 +4,7 @@ import re
 import csv
 import ast
 import sys
+import time
 import uuid
 import glob
 import shutil
@@ -11,12 +12,14 @@ import random
 import aiohttp
 import yaml
 import tqdm
+import psutil
 import orjson as json
 import asyncio
 import tempfile
 import hashlib
 import backoff
 import traceback
+import subprocess
 from pathlib import Path
 import numpy as np
 import pybase64 as base64
@@ -28,6 +31,7 @@ from fiber.chain import weights
 from fiber.chain import fetch_nodes
 from fiber.networking.models import NodeWithFernet as Node
 from fiber.chain.chain_utils import query_substrate
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from functools import lru_cache
 from datetime import datetime, timedelta
 from langdetect import detect as detect_language
@@ -55,14 +59,21 @@ from sqlalchemy import (
     ForeignKey,
     text,
     Index,
+    exists,
 )
 from munch import munchify
 from datasets import load_dataset
 from contextlib import asynccontextmanager, contextmanager
 
 # Database configuration.
+POSTGRES_USER = os.getenv("POSTGRES_USER", "user")
+POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", os.getenv("PGPASSWD", "password"))
+POSTGRES_DB = os.getenv("POSTGRES_DB", "chutes_audit")
+POSTGRES_HOST = os.getenv("POSTGRES_HOST", "postgres")
+POSTGRES_PORT = int(os.getenv("POSTGRES_PORT", "5432"))
+DB_STR = f"postgresql+asyncpg://{POSTGRES_USER}:{POSTGRES_PASSWORD}@{POSTGRES_HOST}:{POSTGRES_PORT}/chutes_audit"
 engine = create_async_engine(
-    os.getenv("POSTGRESQL", "postgresql+asyncpg://user:password@127.0.0.1:5432/chutes_audit"),
+    DB_STR,
     echo=False,
     pool_pre_ping=True,
     pool_reset_on_return="rollback",
@@ -339,6 +350,83 @@ async def get_session() -> AsyncGenerator[AsyncSession, None]:
             raise
         finally:
             await session.close()
+
+
+@lru_cache(maxsize=1)
+def get_optimal_worker_count(ram_per_worker_gb=4):
+    """
+    Calculate how many workers to use for invocation processing, which is
+    basically just free RAM based (ensure each worker has 4GB).
+    """
+    mem = psutil.virtual_memory()
+    available_gb = mem.available / (1024**3)
+    max_workers_by_ram = int(available_gb / ram_per_worker_gb)
+    cpu_count = psutil.cpu_count(logical=True)
+    optimal_workers = max(1, min(max_workers_by_ram, cpu_count))
+    logger.info(f"System RAM: {mem.total / (1024**3):.1f}GB total, {available_gb:.1f}GB available")
+    logger.info(f"CPU cores: {cpu_count}")
+    logger.info(f"Optimal workers: {optimal_workers} (based on {ram_per_worker_gb}GB per worker)")
+    return optimal_workers
+
+
+def escape_for_copy(val):
+    """
+    Helper function to escape values for COPY format.
+    """
+    if val is None:
+        return "\\N"
+    if isinstance(val, (dict, list)):
+        import orjson
+
+        val = orjson.dumps(val).decode()
+    else:
+        val = str(val)
+    return val.replace("\\", "\\\\").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+
+
+def transform_invocation(row):
+    """
+    Transform a single invocation row.
+    """
+    row_data = dict(row)
+    row_data.update(
+        {
+            "miner_uid": int(row["miner_uid"]),
+            "compute_multiplier": float(row["compute_multiplier"]),
+            "bounty": int(row["bounty"]),
+            "started_at": datetime.fromisoformat(row["started_at"].rstrip("Z")).replace(
+                tzinfo=None
+            ),
+        }
+    )
+    if row["completed_at"]:
+        row_data.update(
+            {
+                "completed_at": datetime.fromisoformat(row["completed_at"].rstrip("Z")).replace(
+                    tzinfo=None
+                )
+            }
+        )
+    else:
+        row_data["completed_at"] = None
+    for key in row_data:
+        if isinstance(row_data[key], str) and not row_data[key].strip():
+            row_data[key] = None
+    if row.get("metrics"):
+        try:
+            row_data["metrics"] = ast.literal_eval(row["metrics"])
+        except ValueError:
+            row_data["metrics"] = None
+    else:
+        row_data["metrics"] = None
+    return row_data
+
+
+def process_chunk(chunk):
+    """
+    Process a chunk of invocations.
+    """
+    return [transform_invocation(row) for row in chunk]
 
 
 class Invocation(Base):
@@ -1193,59 +1281,91 @@ class Auditor:
             )
         return data, inv_csv_path, reports_csv_path, jobs_csv_path
 
-    async def load_invocations(self, session, csv_path):
+    async def load_invocations(self, csv_path: str) -> int:
         """
-        Populate our local database with invocations from the CSV exports.
+        Load (after transform) invocations from CSV export into Postgres.
         """
-        logger.info(f"Inserting invocation records from {csv_path}")
-        total = 0
-        with open(csv_path, "r") as infile:
+        logger.info(f"Loading invocation records to transform and load into DB from {csv_path}")
+        with open(csv_path, "r", newline="") as infile:
             reader = csv.DictReader(infile)
-            batch = []
-            for row in reader:
-                row_data = dict(row)
-                row_data.update(
-                    {
-                        "miner_uid": int(row["miner_uid"]),
-                        "compute_multiplier": float(row["compute_multiplier"]),
-                        "bounty": int(row["bounty"]),
-                        "started_at": datetime.fromisoformat(row["started_at"].rstrip("Z")).replace(
-                            tzinfo=None
-                        ),
-                    }
+            rows = list(reader)
+        if not rows:
+            logger.info("No rows to process")
+            return 0
+
+        logger.info(f"Read {len(rows)} rows from CSV, starting transformation...")
+        base_chunk_size = max(1, len(rows) // 100)
+        transform_chunks = [
+            rows[i : i + base_chunk_size] for i in range(0, len(rows), base_chunk_size)
+        ]
+        transformed_rows = []
+        with ProcessPoolExecutor(max_workers=get_optimal_worker_count()) as executor:
+            futures = [executor.submit(process_chunk, chunk) for chunk in transform_chunks]
+            for future in as_completed(futures):
+                try:
+                    transformed_rows.extend(future.result())
+                except Exception as e:
+                    logger.error(f"Chunk transformation failed: {e}")
+        if not transformed_rows:
+            logger.warning("No rows transformed")
+            return 0
+
+        logger.info(f"Transformation complete, {len(transformed_rows)} rows ready to load...")
+        col_names = [c.name for c in Invocation.__table__.columns]
+        timestamp = int(time.time() * 1000)
+        temp_csv_path = f"/tmp/invocations_load_{timestamp}.csv"
+        try:
+            with open(temp_csv_path, "w", newline="") as csvfile:
+                for row in transformed_rows:
+                    fields = [escape_for_copy(row.get(col)) for col in col_names]
+                    csvfile.write("\t".join(fields) + "\n")
+            logger.info(f"Wrote {len(transformed_rows)} rows to temporary CSV: {temp_csv_path}")
+            temp_table = f"temp_invocations_{timestamp}"
+            async with get_session() as session:
+                await session.execute(
+                    text(f"CREATE TABLE {temp_table} (LIKE invocations INCLUDING ALL)")
                 )
-                if row["completed_at"]:
-                    row_data.update(
-                        {
-                            "completed_at": datetime.fromisoformat(
-                                row["completed_at"].rstrip("Z")
-                            ).replace(tzinfo=None)
-                        }
-                    )
-                else:
-                    row_data["completed_at"] = None
-                for key in row_data:
-                    if isinstance(row_data[key], str) and not row_data[key].strip():
-                        row_data[key] = None
-                if row.get("metrics"):
-                    try:
-                        row_data["metrics"] = ast.literal_eval(row["metrics"])
-                    except ValueError as exc:
-                        logger.warning(f"Error parsing metrics: {exc}: {row['metrics']}")
-                else:
-                    row_data["metrics"] = None
-                batch.append(row_data)
-                total += 1
-                if len(batch) == 100:
-                    bulk_insert = pg_insert(Invocation).values(batch).on_conflict_do_nothing()
-                    await session.execute(bulk_insert)
-                    batch = []
-            if batch:
-                bulk_insert = pg_insert(Invocation).values(batch).on_conflict_do_nothing()
-                await session.execute(bulk_insert)
-            await session.commit()
-        if total:
-            logger.success(f"Successfully loaded {total} invocations from {csv_path}")
+                logger.info(f"Created temporary table: {temp_table}")
+            cmd = [
+                "psql",
+                "-h",
+                POSTGRES_HOST,
+                "-p",
+                str(POSTGRES_PORT),
+                "-U",
+                POSTGRES_USER,
+                "-d",
+                POSTGRES_DB,
+                "-c",
+                f"\\copy {temp_table} ({','.join(col_names)}) FROM '{temp_csv_path}' WITH (FORMAT text, DELIMITER E'\\t', NULL '\\N')",
+            ]
+            logger.info("Running psql COPY command...")
+            env = os.environ.copy()
+            env["PGPASSWORD"] = POSTGRES_PASSWORD
+            result = subprocess.run(cmd, capture_output=True, text=True, env=env)
+            if result.returncode != 0:
+                logger.error(f"psql COPY failed: {result.stderr}")
+                raise Exception(f"psql COPY failed: {result.stderr}")
+            logger.info(f"Successfully copied data to temp table {temp_table}")
+            async with get_session() as session:
+                res = await session.execute(
+                    text(f"""
+                        INSERT INTO invocations
+                        SELECT * FROM {temp_table}
+                        ON CONFLICT DO NOTHING
+                    """)
+                )
+                inserted = res.rowcount or 0
+                await session.execute(text(f"DROP TABLE {temp_table}"))
+            logger.success(f"Inserted {inserted} new invocation records (skipped duplicates)")
+            return inserted
+        except Exception as e:
+            logger.error(f"Failed to load invocations: {e}")
+            raise
+        finally:
+            if os.path.exists(temp_csv_path):
+                os.remove(temp_csv_path)
+                logger.debug(f"Cleaned up temporary CSV: {temp_csv_path}")
 
     async def load_reports(self, session, csv_path):
         """
@@ -1648,9 +1768,19 @@ class Auditor:
         # Clean up the old data, plus get a list of existing items to skip.
         delete_directories = []
         async with get_session() as session:
-            query = select(AuditEntry).where(
-                AuditEntry.created_at
-                <= func.timezone("UTC", func.now()) - timedelta(days=7, hours=1)
+            query = (
+                select(AuditEntry)
+                .where(
+                    AuditEntry.created_at
+                    <= func.timezone("UTC", func.now()) - timedelta(days=7, hours=1)
+                )
+                .where(
+                    exists(
+                        select(1)
+                        .where(Invocation.started_at >= AuditEntry.start_time)
+                        .where(Invocation.started_at <= AuditEntry.end_time)
+                    )
+                )
             )
             result = (await session.execute(query)).unique().scalars().all()
             for entry in result:
@@ -1677,6 +1807,10 @@ class Auditor:
             total += 1
             if record["hotkey"] in self.validators:
                 validator_total += 1
+            elif os.getenv("SKIP_MINER_AUDITS", "true").lower() == "true":
+                logger.info(f"Skipping miner audit data: {record['hotkey']}")
+                continue
+
             db_record = AuditEntry(
                 entry_id=record["entry_id"],
                 hotkey=record["hotkey"],
@@ -1714,7 +1848,7 @@ class Auditor:
                 )
                 # Load CSV invocation data if it's from a validator.
                 if inv_csv_path:
-                    await self.load_invocations(session, inv_csv_path)
+                    await self.load_invocations(inv_csv_path)
 
                 # Load reports CSV.
                 if reports_csv_path:

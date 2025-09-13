@@ -1,5 +1,5 @@
 FROM python:3.12
-RUN apt update && apt-get -y install libportaudio2 build-essential curl
+RUN apt update && apt-get -y install libportaudio2 build-essential curl postgresql-client
 RUN curl -sSL https://install.python-poetry.org | python3 -
 ADD pyproject.toml /audit/
 ADD poetry.lock /audit/

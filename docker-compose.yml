@@ -69,7 +69,12 @@ services:
       - hfhub:/root/.cache/huggingface
       - ./reports:/reports
     environment:
-      - POSTGRESQL=postgresql+asyncpg://user:password@postgres:5432/chutes_audit
+      - POSTGRES_USER=user
+      - POSTGRES_PASSWORD=password
+      - POSTGRES_DB=chutes_audit
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - SKIP_MINER_AUDITS=${SKIP_MINER_AUDITS:-false}
     restart: always
     depends_on:
       - postgres

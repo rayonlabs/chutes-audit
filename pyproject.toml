@@ -28,6 +28,7 @@ tqdm = "^4.67.1"
 fiber = {git = "https://github.com/rayonlabs/fiber.git", rev = "2.2.3"}
 cryptography = "<44"
 setuptools = "^75.8.0"
+psutil = "^7.0.0"
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
